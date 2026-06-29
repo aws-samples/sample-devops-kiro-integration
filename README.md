@@ -200,7 +200,7 @@ python3 scripts/trigger_high_cpu.py --url http://<ALB_DNS_NAME> --password <YOUR
 
 The solution includes two layers of protection to keep Kiro CLI focused:
 
-**Steering file** (`.kiro/steering/remediation-agent.md`):
+**Steering file** (`kiro/steering/remediation-agent.md`):
 - Defines which files Kiro CLI can modify and which are protected
 - Limits scope to maximum 3 files per remediation
 - Prevents creating new files, installing dependencies, or deleting files
