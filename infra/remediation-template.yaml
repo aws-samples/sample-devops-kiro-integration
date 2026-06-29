@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  DevOps Agent Remediation - CodeBuild project triggered by SQS messages
+  via Lambda for automated remediation with Kiro CLI.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: Production
+    Description: Environment tag value
+
+  RepositoryName:
+    Type: String
+    Description: CodeCommit repository name
+
+  BranchName:
+    Type: String
+    Default: main
+    Description: Main branch name for CodeBuild source checkout
+
+  BridgeStackName:
+    Type: String
+    Default: devops-agent-kiro-bridge
+    Description: Name of the bridge stack (for importing SQS queue outputs)
+
+  KiroApiKeySecretId:
+    Type: String
+    Default: devops-agent-kiro-bridge/kiro-api-key
+    Description: Secrets Manager secret ID for the Kiro CLI API key
+
+Resources:
+  # ============================================================
+  # CodeBuild - Kiro CLI Remediation
+  # ============================================================
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildBasePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+        - PolicyName: CodeCommitPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:GitPull
+                  - codecommit:GitPush
+                  - codecommit:CreatePullRequest
+                  - codecommit:GetRepository
+                  - codecommit:ListBranches
+                Resource: !Sub 'arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${RepositoryName}'
+        - PolicyName: SqsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  Fn::Sub:
+                    - 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${QueueName}'
+                    - QueueName:
+                        Fn::Select:
+                          - 4
+                          - Fn::Split:
+                              - '/'
+                              - Fn::ImportValue: !Sub '${BridgeStackName}-RemediationQueueUrl'
+        - PolicyName: SecretsManagerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${KiroApiKeySecretId}-*'
+      Tags:
+        - Key: Project
+          Value: DevOpsAgentKiroBridge
+        - Key: Environment
+          Value: !Ref Environment
+
+  RemediationBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${AWS::StackName}-KiroRemediation'
+      Description: Runs Kiro CLI in headless mode to apply DevOps Agent mitigations
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 15
+      Source:
+        Type: CODECOMMIT
+        Location: !Sub 'https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/${RepositoryName}'
+      SourceVersion: !Sub 'refs/heads/${BranchName}'
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: QUEUE_URL
+            Value:
+              Fn::ImportValue: !Sub '${BridgeStackName}-RemediationQueueUrl'
+          - Name: REPO_NAME
+            Value: !Ref RepositoryName
+      Artifacts:
+        Type: NO_ARTIFACTS
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub '/aws/codebuild/${AWS::StackName}-KiroRemediation'
+      Tags:
+        - Key: Project
+          Value: DevOpsAgentKiroBridge
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # SQS to CodeBuild Trigger (Lambda)
+  # ============================================================
+  SqsTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-SqsTrigger:*'
+        - PolicyName: SqsConsumePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  Fn::Sub:
+                    - 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${QueueName}'
+                    - QueueName:
+                        Fn::Select:
+                          - 4
+                          - Fn::Split:
+                              - '/'
+                              - Fn::ImportValue: !Sub '${BridgeStackName}-RemediationQueueUrl'
+        - PolicyName: CodeBuildStartPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                Resource: !GetAtt RemediationBuildProject.Arn
+      Tags:
+        - Key: Project
+          Value: DevOpsAgentKiroBridge
+        - Key: Environment
+          Value: !Ref Environment
+
+  SqsTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-SqsTrigger'
+      Description: Triggers CodeBuild when remediation messages arrive in SQS
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt SqsTriggerRole.Arn
+      Environment:
+        Variables:
+          CODEBUILD_PROJECT: !Ref RemediationBuildProject
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          codebuild = boto3.client('codebuild')
+          PROJECT = os.environ['CODEBUILD_PROJECT']
+
+          def handler(event, context):
+              for record in event['Records']:
+                  body = record['body']
+                  codebuild.start_build(
+                      projectName=PROJECT,
+                      environmentVariablesOverride=[
+                          {
+                              'name': 'SQS_MESSAGE_BODY',
+                              'value': body,
+                              'type': 'PLAINTEXT'
+                          }
+                      ]
+                  )
+              return {'statusCode': 200}
+      Tags:
+        - Key: Project
+          Value: DevOpsAgentKiroBridge
+        - Key: Environment
+          Value: !Ref Environment
+
+  SqsEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn:
+        Fn::Sub:
+          - 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${QueueName}'
+          - QueueName:
+              Fn::Select:
+                - 4
+                - Fn::Split:
+                    - '/'
+                    - Fn::ImportValue: !Sub '${BridgeStackName}-RemediationQueueUrl'
+      FunctionName: !GetAtt SqsTriggerFunction.Arn
+      BatchSize: 1
+      Enabled: true
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  CodeBuildProjectName:
+    Description: Name of the CodeBuild project for Kiro CLI remediation
+    Value: !Ref RemediationBuildProject

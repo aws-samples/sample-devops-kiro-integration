@@ -1,0 +1,44 @@
+version: 0.2
+env:
+  secrets-manager:
+    KIRO_API_KEY: devops-agent-kiro-bridge/kiro-api-key
+phases:
+  install:
+    commands:
+      - curl -fsSL https://cli.kiro.dev/install | bash
+      - export PATH="$HOME/.local/bin:$PATH"
+      - kiro-cli --version || echo "kiro-cli not found in PATH"
+  pre_build:
+    commands:
+      - export BODY="$SQS_MESSAGE_BODY"
+      - echo "$BODY" | python3 -c "import sys,json; from bridge.prompt_generator import generate_prompt; print(generate_prompt(json.load(sys.stdin)))" > /tmp/prompt.md
+      - cat /tmp/prompt.md
+  build:
+    commands:
+      - export BODY="$SQS_MESSAGE_BODY"
+      - BRANCH="kiro-fix/$(echo $BODY | jq -r '.agent_space_id[:8]')-$(date +%Y%m%dT%H%M%S)"
+      - echo "Creating branch $BRANCH"
+      - git checkout -b "$BRANCH"
+      - git config user.email "kiro-cli@devops-agent.aws"
+      - git config user.name "Kiro CLI (DevOps Agent)"
+      - git config credential.helper '!aws codecommit credential-helper $@'
+      - git config credential.UseHttpPath true
+      - echo "--- Starting Kiro CLI at $(date -u +%Y-%m-%dT%H:%M:%SZ) ---"
+      - kiro-cli chat --no-interactive --trust-tools=read,write,grep,shell "$(cat /tmp/prompt.md)"
+      - echo "--- Kiro CLI finished at $(date -u +%Y-%m-%dT%H:%M:%SZ) ---"
+      - git add -A ':!__pycache__' ':!*/__pycache__'
+      - 'CHANGED_FILES=$(git diff --cached --name-only | wc -l | tr -d " ")'
+      - 'echo "Files changed: $CHANGED_FILES"'
+      - 'if [ "$CHANGED_FILES" -eq 0 ]; then echo "GUARDRAIL: No files changed. Nothing to commit."; exit 0; fi'
+      - 'if [ "$CHANGED_FILES" -gt 5 ]; then echo "GUARDRAIL: Too many files changed ($CHANGED_FILES). Aborting to prevent unintended modifications."; git checkout -- .; exit 1; fi'
+      - 'PROTECTED="buildspec.yml infra/remediation-template.yaml infra/event-capture-template.yaml"'
+      - 'for f in $PROTECTED; do if git diff --cached --name-only | grep -q "^$f$"; then echo "GUARDRAIL: Protected file $f was modified. Aborting."; git checkout -- .; exit 1; fi; done'
+      - 'for f in $(git diff --cached --name-only | grep "\.py$"); do python3 -m py_compile "$f" || { echo "GUARDRAIL: Python syntax error in $f. Aborting."; git checkout -- .; exit 1; }; done'
+      - 'for f in $(git diff --cached --name-only | grep "\.yaml$\|\.yml$"); do python3 -c "import yaml; yaml.safe_load(open(\"$f\"))" 2>/dev/null || echo "WARN: YAML parse issue in $f (may use CloudFormation intrinsics)"; done'
+      - 'git commit -m "fix: automated remediation from DevOps Agent"'
+      - git push origin "$BRANCH"
+  post_build:
+    commands:
+      - export BODY="$SQS_MESSAGE_BODY"
+      - 'TITLE=$(echo $BODY | jq -r ".mitigation_summary.action" | head -c 100)'
+      - 'aws codecommit create-pull-request --title "[DevOps Agent] $TITLE" --description "Automated remediation from AWS DevOps Agent mitigation" --targets repositoryName=$REPO_NAME,sourceReference=$BRANCH,destinationReference=main'

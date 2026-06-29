@@ -1,0 +1,331 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  DevOps Agent Event Capture - Captures mitigation completion events via
+  EventBridge, extracts data through Lambda, and buffers in SQS for
+  CodeBuild remediation.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: Production
+    Description: Environment tag value
+
+  Boto3LayerArn:
+    Type: String
+    Description: >-
+      ARN of a Lambda layer containing boto3 with devops-agent service support.
+      See README.md for instructions on creating this layer.
+
+Resources:
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Project
+          Value: DevOpsAgentKiroBridge
+        - Key: Environment
+          Value: !Ref Environment
+
+  RemediationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 900
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Project
+          Value: DevOpsAgentKiroBridge
+        - Key: Environment
+          Value: !Ref Environment
+
+  ExtractorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIDevOpsAgentReadOnlyAccess
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-ExtractorLambda:*'
+        - PolicyName: DevOpsAgentApiPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aidevops:ListJournalRecords
+                  - aidevops:ListExecutions
+                Resource: '*'
+        - PolicyName: SqsSendMessagePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt RemediationQueue.Arn
+      Tags:
+        - Key: Project
+          Value: DevOpsAgentKiroBridge
+        - Key: Environment
+          Value: !Ref Environment
+
+  ExtractorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ExtractorLambda'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt ExtractorLambdaRole.Arn
+      Layers:
+        - !Ref Boto3LayerArn
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref RemediationQueue
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import logging
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          sqs = boto3.client('sqs')
+          devops = boto3.client('devops-agent', region_name='us-east-1')
+
+          QUEUE_URL = os.environ['QUEUE_URL']
+
+
+          def _log(level, **kwargs):
+              getattr(logger, level)(json.dumps(kwargs))
+
+
+          def _extract_mitigation_data(records):
+              """Search journal records for mitigation_summary and execution_plan.
+
+              Searches through all records looking for JSON containing both
+              mitigation_summary and execution_plan keys. Checks:
+              1. Raw content string for embedded JSON
+              2. Assistant message tool_use inputs
+              3. Assistant message text items
+              """
+              for record in records:
+                  raw = record.get('content', '')
+                  if not raw or 'mitigation_summary' not in raw:
+                      continue
+
+                  try:
+                      content_obj = json.loads(raw) if isinstance(raw, str) else raw
+                  except (json.JSONDecodeError, TypeError):
+                      continue
+
+                  # If content itself has the keys directly
+                  if isinstance(content_obj, dict):
+                      if 'mitigation_summary' in content_obj and 'execution_plan' in content_obj:
+                          return content_obj['mitigation_summary'], content_obj['execution_plan']
+
+                  # Check assistant message content items
+                  if content_obj.get('role') != 'assistant':
+                      continue
+
+                  for item in content_obj.get('content', []):
+                      if item.get('type') == 'tool_use':
+                          inp = item.get('input', {})
+                          if isinstance(inp, str):
+                              try:
+                                  inp = json.loads(inp)
+                              except (json.JSONDecodeError, TypeError):
+                                  continue
+                          if isinstance(inp, dict) and 'mitigation_summary' in inp and 'execution_plan' in inp:
+                              return inp['mitigation_summary'], inp['execution_plan']
+
+                      if item.get('type') == 'text':
+                          txt = item.get('text', '')
+                          if 'mitigation_summary' in txt and 'execution_plan' in txt:
+                              try:
+                                  parsed = json.loads(txt)
+                                  if 'mitigation_summary' in parsed:
+                                      return parsed['mitigation_summary'], parsed.get('execution_plan', [])
+                              except (json.JSONDecodeError, TypeError):
+                                  pass
+
+              return None, None
+
+
+          def handler(event, context):
+              detail = event.get('detail', {})
+              metadata = detail.get('metadata', {})
+
+              agent_space_id = metadata.get('agent_space_id')
+              task_id = metadata.get('task_id')
+              execution_id = metadata.get('execution_id')
+
+              missing = [f for f in ('agent_space_id', 'task_id')
+                         if not metadata.get(f)]
+              if missing:
+                  _log('error',
+                       error='validation_error',
+                       message=f'Missing required fields: {missing}',
+                       task_id=task_id,
+                       agent_space_id=agent_space_id,
+                       outcome='failure')
+                  return {'statusCode': 400, 'body': f'Missing fields: {missing}'}
+
+              try:
+                  # Step 1: Find the mitigation execution
+                  exec_response = devops.list_executions(
+                      agentSpaceId=agent_space_id,
+                      taskId=task_id
+                  )
+                  executions = exec_response.get('executions', [])
+                  mitigation_exec = next(
+                      (e for e in executions if e.get('agentSubTask') == 'mitigation'),
+                      None
+                  )
+                  if not mitigation_exec:
+                      _log('error', error='no_mitigation_execution',
+                           task_id=task_id, agent_space_id=agent_space_id,
+                           outcome='failure')
+                      raise RuntimeError('No mitigation execution found')
+
+                  mitigation_execution_id = mitigation_exec['executionId']
+                  _log('info', event='found_mitigation_execution',
+                       mitigation_execution_id=mitigation_execution_id,
+                       task_id=task_id)
+
+                  # Step 2: Get journal records
+                  response = devops.list_journal_records(
+                      agentSpaceId=agent_space_id,
+                      executionId=mitigation_execution_id
+                  )
+                  all_records = response.get('records', [])
+                  _log('info', total_records=len(all_records), task_id=task_id)
+
+                  # Step 3: Extract mitigation data from records
+                  mitigation_summary, execution_plan = _extract_mitigation_data(all_records)
+
+                  if not mitigation_summary:
+                      _log('error', error='no_mitigation_data',
+                           message='Could not find mitigation_summary in journal records',
+                           task_id=task_id, agent_space_id=agent_space_id,
+                           outcome='failure')
+                      raise RuntimeError('No mitigation data found in journal records')
+
+                  # Step 4: Publish to SQS
+                  message = {
+                      'agent_space_id': agent_space_id,
+                      'execution_id': mitigation_execution_id,
+                      'mitigation_summary': mitigation_summary,
+                      'execution_plan': execution_plan
+                  }
+
+                  sqs.send_message(
+                      QueueUrl=QUEUE_URL,
+                      MessageBody=json.dumps(message)
+                  )
+
+                  _log('info',
+                       agent_space_id=agent_space_id,
+                       execution_id=mitigation_execution_id,
+                       outcome='success')
+
+                  return {'statusCode': 200, 'body': 'Message published'}
+
+              except Exception as e:
+                  _log('error',
+                       error=str(e),
+                       task_id=task_id,
+                       agent_space_id=agent_space_id,
+                       outcome='failure')
+                  raise
+      Tags:
+        - Key: Project
+          Value: DevOpsAgentKiroBridge
+        - Key: Environment
+          Value: !Ref Environment
+
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-DLQ-MessagesVisible'
+      AlarmDescription: Alarm when messages appear in the Dead Letter Queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: DevOpsAgentKiroBridge
+        - Key: Environment
+          Value: !Ref Environment
+
+  MitigationCompletedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Captures DevOps Agent mitigation completion events
+      EventPattern:
+        source:
+          - aws.aidevops
+        detail-type:
+          - Mitigation Completed
+        detail:
+          data:
+            status:
+              - COMPLETED
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ExtractorLambda.Arn
+          Id: ExtractorLambdaTarget
+      Tags:
+        - Key: Project
+          Value: DevOpsAgentKiroBridge
+        - Key: Environment
+          Value: !Ref Environment
+
+  ExtractorLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ExtractorLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MitigationCompletedRule.Arn
+
+Outputs:
+  RemediationQueueUrl:
+    Description: SQS Remediation Queue URL
+    Value: !Ref RemediationQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-RemediationQueueUrl'
+  DeadLetterQueueUrl:
+    Description: SQS Dead Letter Queue URL
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-DeadLetterQueueUrl'

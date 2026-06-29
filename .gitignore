@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+frontend/node_modules/
+
+# Build artifacts
+frontend/dist/
+
+# Pytest
+.pytest_cache/
+backend/.pytest_cache/
+backend/tests/__pycache__/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env/
+env/
+.python-version
+
+# Kiro CLI execution logs
+logs/
+
+# Coverage reports
+.coverage
+htmlcov/
+coverage.xml
+
+# Secrets (defensive)
+*.pem
+*.key
+
+# Local database files
+*.sqlite
+*.db
+
+# Build logs
+build.log
+
